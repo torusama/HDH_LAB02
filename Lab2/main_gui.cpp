@@ -544,25 +544,37 @@ static void ShowSelectedFileInfo(int index) {
 }
 
 static std::vector<std::string> GetAvailableDrives() {
-    std::vector<std::string> drives;
+    std::vector<std::string> removableDrives;
+    std::vector<std::string> fixedDrives;
     char buffer[512]{};
     DWORD len = GetLogicalDriveStringsA(static_cast<DWORD>(sizeof(buffer) - 1), buffer);
 
     if (len == 0 || len > sizeof(buffer) - 1) {
-        return drives;
+        return {};
     }
 
     for (char* p = buffer; *p != '\0'; p += std::strlen(p) + 1) {
         UINT type = GetDriveTypeA(p);
-        if (type == DRIVE_REMOVABLE || type == DRIVE_FIXED) {
-            if (std::strlen(p) >= 2 && p[1] == ':') {
-                drives.emplace_back(std::string(p, p + 2));
-            }
+        if (std::strlen(p) < 2 || p[1] != ':') {
+            continue;
+        }
+
+        std::string drive(p, p + 2);
+        if (type == DRIVE_REMOVABLE) {
+            removableDrives.push_back(drive);
+        } else if (type == DRIVE_FIXED) {
+            fixedDrives.push_back(drive);
         }
     }
 
-    std::sort(drives.begin(), drives.end());
-    drives.erase(std::unique(drives.begin(), drives.end()), drives.end());
+    std::sort(removableDrives.begin(), removableDrives.end());
+    removableDrives.erase(std::unique(removableDrives.begin(), removableDrives.end()), removableDrives.end());
+
+    std::sort(fixedDrives.begin(), fixedDrives.end());
+    fixedDrives.erase(std::unique(fixedDrives.begin(), fixedDrives.end()), fixedDrives.end());
+
+    std::vector<std::string> drives = removableDrives;
+    drives.insert(drives.end(), fixedDrives.begin(), fixedDrives.end());
     return drives;
 }
 
