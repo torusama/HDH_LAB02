@@ -33,60 +33,60 @@ BootSector::BootSector(){
     _valid = false;
 };
 
-bool BootSector::isValid() {
+bool BootSector::isValid() const {
     if (!_valid) return false;
     return true;
 }
 
-uint16_t BootSector::getBytesPerSector() {
+uint16_t BootSector::getBytesPerSector() const {
     return _raw.BPB_BytsPerSec;
 }
 
-uint8_t BootSector::getSectorsPerCluster() {
+uint8_t BootSector::getSectorsPerCluster() const {
     return _raw.BPB_SecPerClus;
 }
 
-uint16_t BootSector::getReservedSectors() {
+uint16_t BootSector::getReservedSectors() const {
     return _raw.BPB_RsvdSecCnt;
 }
 
-uint8_t BootSector::getNumFATs() {
+uint8_t BootSector::getNumFATs() const {
     return _raw.BPB_NumFATs;
 }
 
-uint32_t BootSector::getSectorsPerFAT() {
+uint32_t BootSector::getSectorsPerFAT() const {
     return _raw.BPB_FATSz32;
 }
 
-uint32_t BootSector::getTotalSectors() {
+uint32_t BootSector::getTotalSectors() const {
     return _raw.BPB_TotSec32;
 }
 
-uint32_t BootSector::getRootCluster() {
+uint32_t BootSector::getRootCluster() const {
     return _raw.BPB_RootClus;
 }
 
-uint32_t BootSector::getRDETSectors() {
+uint32_t BootSector::getRDETSectors() const {
     return _raw.BPB_SecPerClus;
 }
 
- uint64_t BootSector::getFATStartSector() {
+ uint64_t BootSector::getFATStartSector() const {
     return _raw.BPB_RsvdSecCnt;
  }
 
- uint64_t BootSector::getDataStartSector() {
+ uint64_t BootSector::getDataStartSector() const {
     return _raw.BPB_RsvdSecCnt + (_raw.BPB_FATSz32 * _raw.BPB_NumFATs);
  }
 
- uint32_t BootSector::getClusterSize() {
+ uint32_t BootSector::getClusterSize() const {
     return _raw.BPB_SecPerClus * _raw.BPB_BytsPerSec;
  }
 
- uint64_t BootSector::clusterToSector(uint32_t cluster) {
+ uint64_t BootSector::clusterToSector(uint32_t cluster) const {
     uint32_t DataStartSector = _raw.BPB_NumFATs * _raw.BPB_FATSz32 + _raw.BPB_RsvdSecCnt;
     return (cluster - 2) * _raw.BPB_SecPerClus + DataStartSector;
  }
 
- const BootSectorRaw& BootSector::getRaw() {
+ const BootSectorRaw& BootSector::getRaw() const {
     return _raw;
  }

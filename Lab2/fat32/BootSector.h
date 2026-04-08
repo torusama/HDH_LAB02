@@ -3,7 +3,6 @@
 #include <string>
 #include <cstring>
 #include "DiskReader.h"
-using namespace std;
 
 // Struct ánh xạ trực tiếp lên 512 bytes đầu của đĩa FAT32 (BPB - BIOS Parameter Block)
 // Các trường được đặt đúng thứ tự theo chuẩn FAT32 specification
@@ -56,39 +55,39 @@ public:
     bool load(DiskReader& reader);
 
     // Kiểm tra đã load thành công chưa
-    bool isValid();
+    bool isValid() const; // const để cho nó chỉ đc đọc
 
     // ─── Getters cho Chức năng 1 (hiển thị bảng) ───────────────────────────
 
-    uint16_t getBytesPerSector();  // BPB_BytsPerSec
-    uint8_t  getSectorsPerCluster();  // BPB_SecPerClus
-    uint16_t getReservedSectors();  // BPB_RsvdSecCnt  (Boot Sector region)
-    uint8_t  getNumFATs();  // BPB_NumFATs
-    uint32_t getSectorsPerFAT();  // BPB_FATSz32
-    uint32_t getTotalSectors();  // BPB_TotSec32
-    uint32_t getRootCluster();  // BPB_RootClus
+    uint16_t getBytesPerSector() const;  // BPB_BytsPerSec
+    uint8_t  getSectorsPerCluster() const;  // BPB_SecPerClus
+    uint16_t getReservedSectors() const;  // BPB_RsvdSecCnt  (Boot Sector region)
+    uint8_t  getNumFATs() const;  // BPB_NumFATs
+    uint32_t getSectorsPerFAT() const;  // BPB_FATSz32
+    uint32_t getTotalSectors() const;  // BPB_TotSec32
+    uint32_t getRootCluster() const;  // BPB_RootClus
 
     // Số sector của vùng RDET (Root Dir)
     // FAT32: root nằm trong Data region, bắt đầu tại RootClus
     // = SectorsPerCluster (tính cho 1 cluster, có thể mở rộng theo chain)
-    uint32_t getRDETSectors();
+    uint32_t getRDETSectors() const;
 
     // ─── Giá trị tính sẵn (dùng nội bộ cho FATTable, DirectoryEntry) ────────
 
     // Sector đầu tiên của FAT table 1
-    uint64_t getFATStartSector();  // = RsvdSecCnt
+    uint64_t getFATStartSector() const;  // = RsvdSecCnt
 
     // Sector đầu tiên của vùng Data
-    uint64_t getDataStartSector();  // = RsvdSecCnt + NumFATs * FATSz32
+    uint64_t getDataStartSector() const;  // = RsvdSecCnt + NumFATs * FATSz32
 
     // Kích thước 1 cluster tính bằng byte
-    uint32_t getClusterSize();  // = BytsPerSec * SecPerClus
+    uint32_t getClusterSize() const;  // = BytsPerSec * SecPerClus
 
     // Convert cluster number → sector number
-    uint64_t clusterToSector(uint32_t cluster);
+    uint64_t clusterToSector(uint32_t cluster) const;
 
     // Trả về raw struct (dùng khi cần truy cập trường ít dùng)
-    const BootSectorRaw& getRaw();
+    const BootSectorRaw& getRaw() const;
 
 private:
     BootSectorRaw _raw;
