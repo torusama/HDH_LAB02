@@ -12,12 +12,14 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <functional>
 #include <cctype>
 #include <cstring>
 #include "fat32/DiskReader.h"
 #include "fat32/BootSector.h"
 #include "fat32/FATTable.h"
 #include "fat32/DirectoryEntry.h"
+#include "scheduler/Scheduler.h"
 
 #pragma comment(lib, "Comctl32.lib")
 
@@ -42,6 +44,13 @@ struct ParsedSchedule {
     std::vector<ProcessInfo> processes;
 };
 
+struct SimulationResult {
+    bool ok = false;
+    std::string error;
+    std::vector<ScheduleEvent> timeline;
+    std::vector<Process> processes;
+};
+
 enum ControlId {
     IDC_DRIVE_COMBO = 1001,
     IDC_REFRESH_BTN,
@@ -56,7 +65,9 @@ enum ControlId {
     IDC_FILE_LABEL,
     IDC_DETAIL_LABEL,
     IDC_CONTENT_LABEL,
-    IDC_PROCESS_LABEL
+    IDC_PROCESS_LABEL,
+    IDC_GANTT_LABEL,
+    IDC_GANTT_CHART
 };
 
 static HWND g_hMainWnd = nullptr;
@@ -67,6 +78,8 @@ static HWND g_hDetailEdit = nullptr;
 static HWND g_hContentEdit = nullptr;
 static HWND g_hProcessList = nullptr;
 static HWND g_hStatusText = nullptr;
+static HWND g_hGanttLabel = nullptr;
+static HWND g_hGanttChart = nullptr;
 static HWND g_hBootLabel = nullptr;
 static HWND g_hFileLabel = nullptr;
 static HWND g_hDetailLabel = nullptr;
@@ -86,8 +99,14 @@ static DirectoryEntry g_directoryScanner;
 static std::vector<FileInfo> g_txtFiles;
 static std::string g_initialDrive;
 static bool g_hasLoadedDrive = false;
+static ParsedSchedule g_currentSchedule;
+static SimulationResult g_currentSimulation;
+static std::string g_currentDetailBase;
+static bool g_hasSimulationData = false;
+static int g_ganttScrollX = 0;
 
 static const char* kAppTitle = "Lab 2 | FAT32 Schedule Explorer";
+static const char* kGanttChartClass = "Lab2GanttChartView";
 static const COLORREF kColorWindowBg = RGB(245, 247, 250);
 static const COLORREF kColorCardBg = RGB(255, 255, 255);
 static const COLORREF kColorTextMain = RGB(32, 32, 32);
@@ -98,6 +117,22 @@ static const QueueInfo* FindQueueById(const std::vector<QueueInfo>& queues, cons
         if (q.id == queueId) return &q;
     }
     return nullptr;
+}
+
+static Process* FindProcessById(std::vector<Process>& processes, const std::string& processId) {
+    for (auto& process : processes) {
+        if (process.getPID() == processId) return &process;
+    }
+    return nullptr;
+}
+
+static COLORREF ColorFromKey(const std::string& key) {
+    std::hash<std::string> hasher;
+    const size_t value = hasher(key);
+    const int r = 90 + static_cast<int>(value & 0x3F);
+    const int g = 110 + static_cast<int>((value >> 6) & 0x5F);
+    const int b = 120 + static_cast<int>((value >> 13) & 0x5F);
+    return RGB(r, g, b);
 }
 
 static std::string ToWindowsNewlines(const std::string& text) {
@@ -273,6 +308,7 @@ static void ApplyFontsToChildren(HWND hwnd) {
     ApplyControlFont(g_hFileLabel, g_hFontLabel);
     ApplyControlFont(g_hDetailLabel, g_hFontLabel);
     ApplyControlFont(g_hContentLabel, g_hFontLabel);
+    ApplyControlFont(g_hGanttLabel, g_hFontLabel);
     ApplyControlFont(g_hProcessLabel, g_hFontLabel);
     ApplyControlFont(g_hBootList, g_hFontUI);
     ApplyControlFont(g_hFileList, g_hFontUI);
@@ -304,7 +340,7 @@ static void ResizeProcessColumns() {
     int totalWidth = rc.right - rc.left;
     if (totalWidth <= 0) return;
 
-    const int columnCount = 6;
+    const int columnCount = 9;
     const int baseWidth = totalWidth / columnCount;
     int remainder = totalWidth % columnCount;
 
@@ -362,6 +398,121 @@ static void ClearFileViews() {
     SendMessageA(g_hDetailEdit, EM_SETSEL, 0, 0);
     SendMessageA(g_hContentEdit, EM_SETSEL, 0, 0);
     ClearProcessList();
+}
+
+static void ClearProcessHighlight() {
+    if (!g_hProcessList) return;
+
+    int count = ListView_GetItemCount(g_hProcessList);
+    for (int i = 0; i < count; ++i) {
+        ListView_SetItemState(g_hProcessList, i, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+}
+
+static void RedrawGanttChart() {
+    if (g_hGanttChart) {
+        InvalidateRect(g_hGanttChart, nullptr, TRUE);
+        UpdateWindow(g_hGanttChart);
+    }
+}
+
+static int GetTimelineEndTime() {
+    int totalEndTime = 0;
+    for (const auto& event : g_currentSimulation.timeline) {
+        totalEndTime = std::max(totalEndTime, event.EndTime);
+    }
+    return std::max(totalEndTime, 1);
+}
+
+static int GetGanttContentWidth() {
+    const int totalEndTime = GetTimelineEndTime();
+    const int widthFromTime = totalEndTime * 56;
+    const int widthFromEvents = static_cast<int>(g_currentSimulation.timeline.size()) * 72;
+    return std::max(900, std::max(widthFromTime, widthFromEvents));
+}
+
+static void UpdateGanttScrollInfo() {
+    if (!g_hGanttChart) return;
+
+    RECT rc{};
+    GetClientRect(g_hGanttChart, &rc);
+    const int viewportWidth = std::max(1, static_cast<int>(rc.right - rc.left));
+    const int contentWidth = (g_hasSimulationData && g_currentSimulation.ok && !g_currentSimulation.timeline.empty())
+        ? GetGanttContentWidth()
+        : viewportWidth;
+
+    const int maxScroll = std::max(0, contentWidth - viewportWidth);
+    g_ganttScrollX = std::clamp(g_ganttScrollX, 0, maxScroll);
+
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_PAGE | SIF_RANGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = std::max(contentWidth - 1, 0);
+    si.nPage = static_cast<UINT>(viewportWidth);
+    si.nPos = g_ganttScrollX;
+    SetScrollInfo(g_hGanttChart, SB_HORZ, &si, TRUE);
+
+}
+
+static bool HandleGanttHScroll(HWND hwnd, WPARAM wParam) {
+    if (!hwnd) return false;
+
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_ALL;
+    GetScrollInfo(hwnd, SB_HORZ, &si);
+
+    int newPos = g_ganttScrollX;
+    switch (LOWORD(wParam)) {
+    case SB_LINELEFT:
+        newPos -= 40;
+        break;
+    case SB_LINERIGHT:
+        newPos += 40;
+        break;
+    case SB_PAGELEFT:
+        newPos -= static_cast<int>(si.nPage);
+        break;
+    case SB_PAGERIGHT:
+        newPos += static_cast<int>(si.nPage);
+        break;
+    case SB_THUMBPOSITION:
+    case SB_THUMBTRACK:
+        newPos = si.nTrackPos;
+        break;
+    case SB_LEFT:
+        newPos = si.nMin;
+        break;
+    case SB_RIGHT:
+        newPos = si.nMax;
+        break;
+    default:
+        return false;
+    }
+
+    const int maxScroll = std::max(0, si.nMax - static_cast<int>(si.nPage) + 1);
+    g_ganttScrollX = std::clamp(newPos, 0, maxScroll);
+    SetScrollPos(hwnd, SB_HORZ, g_ganttScrollX, TRUE);
+    RedrawGanttChart();
+    return true;
+}
+
+static void HighlightProcessRow(const std::string& processId) {
+    if (!g_hProcessList) return;
+
+    ClearProcessHighlight();
+    int count = ListView_GetItemCount(g_hProcessList);
+    char buffer[256]{};
+
+    for (int i = 0; i < count; ++i) {
+        ListView_GetItemText(g_hProcessList, i, 0, buffer, static_cast<int>(sizeof(buffer)));
+        if (processId == buffer) {
+            ListView_SetItemState(g_hProcessList, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(g_hProcessList, i, FALSE);
+            break;
+        }
+    }
 }
 
 static ParsedSchedule ParseScheduleText(const std::string& text) {
@@ -429,6 +580,230 @@ static ParsedSchedule ParseScheduleText(const std::string& text) {
     return parsed;
 }
 
+static SimulationResult RunScheduleSimulation(const ParsedSchedule& parsed) {
+    SimulationResult result;
+
+    if (!parsed.ok) {
+        result.error = "Cannot simulate because the schedule input is invalid.";
+        return result;
+    }
+
+    if (parsed.queues.empty()) {
+        result.ok = true;
+        result.error = "No queues were defined, so nothing was simulated.";
+        return result;
+    }
+
+    Scheduler scheduler;
+    for (const auto& queue : parsed.queues) {
+        scheduler.addQueue(Queue(queue.id, queue.timeSlice, queue.algorithm));
+    }
+
+    for (const auto& process : parsed.processes) {
+        scheduler.addProcess(Process(process.id, process.arrivalTime, process.burstTime, process.queueId));
+    }
+
+    scheduler.runScheduling();
+    result.timeline = scheduler.getTimeline();
+    result.processes = scheduler.getProcesses();
+    result.ok = true;
+    return result;
+}
+
+static std::string BuildSimulationSummary(const SimulationResult& simulation) {
+    if (!simulation.ok) {
+        return "Simulation error: " + simulation.error + "\r\n";
+    }
+
+    std::ostringstream summary;
+    summary << "Simulation events: " << simulation.timeline.size() << "\r\n";
+
+    if (simulation.processes.empty()) {
+        summary << "No processes to execute.\r\n";
+        return summary.str();
+    }
+
+    double turnaroundSum = 0.0;
+    double waitingSum = 0.0;
+    for (auto process : simulation.processes) {
+        turnaroundSum += process.getTurnaroundTime();
+        waitingSum += process.getWaitingTime();
+    }
+
+    summary << "Average turnaround: " << std::fixed << std::setprecision(2)
+            << (turnaroundSum / simulation.processes.size()) << "\r\n";
+    summary << "Average waiting: " << std::fixed << std::setprecision(2)
+            << (waitingSum / simulation.processes.size()) << "\r\n";
+
+    if (!simulation.timeline.empty()) {
+        summary << "Timeline preview:\r\n";
+        for (const auto& event : simulation.timeline) {
+            summary << "[" << event.StartTime << " - " << event.EndTime << "] "
+                    << event.QueueID << " -> " << event.ProcessID << "\r\n";
+        }
+    }
+
+    return summary.str();
+}
+
+static void RefreshDetailPane() {
+    SetWindowTextA(g_hDetailEdit, g_currentDetailBase.c_str());
+    SendMessageA(g_hDetailEdit, EM_SETSEL, 0, 0);
+    SendMessageA(g_hDetailEdit, EM_SCROLLCARET, 0, 0);
+}
+
+static void PaintGanttChart(HDC hdc, const RECT& clientRect) {
+    HBRUSH bgBrush = CreateSolidBrush(kColorCardBg);
+    FillRect(hdc, &clientRect, bgBrush);
+    DeleteObject(bgBrush);
+
+    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(210, 216, 224));
+    HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, borderPen));
+    HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
+    Rectangle(hdc, clientRect.left, clientRect.top, clientRect.right, clientRect.bottom);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(borderPen);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, kColorTextMain);
+
+    RECT inner = clientRect;
+    InflateRect(&inner, -14, -12);
+    if (inner.right <= inner.left || inner.bottom <= inner.top) return;
+
+    if (!g_hasSimulationData || !g_currentSimulation.ok || g_currentSimulation.timeline.empty()) {
+        DrawTextA(hdc, "Load a valid schedule to see the Gantt chart.", -1,
+                  &inner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return;
+    }
+
+    const int totalEndTime = GetTimelineEndTime();
+    const int contentWidth = GetGanttContentWidth();
+    const int axisLeftWorld = 44;
+    const int axisRightWorld = contentWidth - 36;
+    const int axisTop = inner.top + 26;
+    const int axisBottom = inner.bottom - 30;
+    const int axisWidthWorld = std::max(1, axisRightWorld - axisLeftWorld);
+    const int barHeight = std::min(52, std::max(32, axisBottom - axisTop - 16));
+    const int barTop = axisTop + std::max(0, (axisBottom - axisTop - barHeight) / 2);
+    const int barBottom = barTop + barHeight;
+    const int axisY = barBottom + 10;
+
+    int axisLeft = inner.left + axisLeftWorld - g_ganttScrollX;
+    int axisRight = inner.left + axisRightWorld - g_ganttScrollX;
+
+    HPEN axisPen = CreatePen(PS_SOLID, 1, RGB(170, 176, 186));
+    oldPen = static_cast<HPEN>(SelectObject(hdc, axisPen));
+    MoveToEx(hdc, axisLeft, axisY, nullptr);
+    LineTo(hdc, axisRight, axisY);
+    LineTo(hdc, axisRight - 8, axisY - 5);
+    MoveToEx(hdc, axisRight, axisY, nullptr);
+    LineTo(hdc, axisRight - 8, axisY + 5);
+
+    for (int timeValue = 0; timeValue <= totalEndTime; ++timeValue) {
+        int x = inner.left + axisLeftWorld + (timeValue * axisWidthWorld) / totalEndTime - g_ganttScrollX;
+        if (x < inner.left - 40 || x > inner.right + 40) continue;
+
+        MoveToEx(hdc, x, axisY, nullptr);
+        LineTo(hdc, x, axisY + 7);
+
+        RECT tickRect{ x - 20, axisY + 10, x + 20, inner.bottom };
+        std::string timeText = std::to_string(timeValue);
+        DrawTextA(hdc, timeText.c_str(), -1, &tickRect, DT_CENTER | DT_TOP | DT_SINGLELINE);
+    }
+
+    SelectObject(hdc, oldPen);
+    DeleteObject(axisPen);
+
+    RECT titleRect{ inner.left, inner.top - 2, inner.right, axisTop - 2 };
+    std::string headerText = "Final Gantt Chart";
+    DrawTextA(hdc, headerText.c_str(), -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    int savedDc = SaveDC(hdc);
+    IntersectClipRect(hdc, inner.left, inner.top, inner.right, inner.bottom);
+
+    for (size_t i = 0; i < g_currentSimulation.timeline.size(); ++i) {
+        const auto& event = g_currentSimulation.timeline[i];
+        int left = inner.left + axisLeftWorld + (event.StartTime * axisWidthWorld) / totalEndTime - g_ganttScrollX;
+        int right = inner.left + axisLeftWorld + (event.EndTime * axisWidthWorld) / totalEndTime - g_ganttScrollX;
+        if (right <= left) right = left + 1;
+        if (right - left < 30) right = left + 30;
+        if (right < inner.left || left > inner.right) continue;
+
+        RECT barRect{
+            std::max(left, static_cast<int>(inner.left)),
+            barTop,
+            std::min(right, static_cast<int>(inner.right)),
+            barBottom
+        };
+        if (barRect.right <= barRect.left) continue;
+        COLORREF fillColor = ColorFromKey(event.QueueID + ":" + event.ProcessID);
+        HBRUSH fillBrush = CreateSolidBrush(fillColor);
+        HPEN barPen = CreatePen(PS_SOLID, 1, RGB(80, 88, 96));
+        oldBrush = static_cast<HBRUSH>(SelectObject(hdc, fillBrush));
+        oldPen = static_cast<HPEN>(SelectObject(hdc, barPen));
+        RoundRect(hdc, barRect.left, barRect.top, barRect.right, barRect.bottom, 10, 10);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(fillBrush);
+        DeleteObject(barPen);
+
+        RECT textRect = barRect;
+        InflateRect(&textRect, -6, -4);
+        SetTextColor(hdc, RGB(255, 255, 255));
+        std::string label = event.ProcessID + " | " + event.QueueID;
+        DrawTextA(hdc, label.c_str(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    RestoreDC(hdc, savedDc);
+
+    SetTextColor(hdc, kColorTextMain);
+}
+
+static LRESULT CALLBACK GanttChartProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_SIZE:
+        UpdateGanttScrollInfo();
+        break;
+
+    case WM_MOUSEWHEEL: {
+        const short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        const int step = 60;
+        const int direction = delta > 0 ? -step : step;
+        SendMessageA(hwnd, WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, std::max(0, g_ganttScrollX + direction)), 0);
+        return 0;
+    }
+
+    case WM_HSCROLL: {
+        if (HandleGanttHScroll(hwnd, wParam)) {
+            return 0;
+        }
+        break;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        PaintGanttChart(hdc, rc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static void RefreshSimulationView() {
+    RefreshDetailPane();
+    RedrawGanttChart();
+}
+
 static void PopulateBootInfo() {
     ClearBootList();
 
@@ -455,13 +830,17 @@ static void PopulateFileList() {
     }
 }
 
-static void PopulateProcessList(const ParsedSchedule& parsed) {
+static void PopulateProcessList(const ParsedSchedule& parsed, SimulationResult* simulation = nullptr) {
     ClearProcessList();
 
     for (const auto& proc : parsed.processes) {
         const QueueInfo* queue = FindQueueById(parsed.queues, proc.queueId);
+        Process* simulatedProcess = simulation ? FindProcessById(simulation->processes, proc.id) : nullptr;
         std::string timeSlice = queue ? std::to_string(queue->timeSlice) : "N/A";
         std::string algorithm = queue ? queue->algorithm : "N/A";
+        std::string completion = simulatedProcess ? std::to_string(simulatedProcess->getCompletionTime()) : "N/A";
+        std::string turnaround = simulatedProcess ? std::to_string(simulatedProcess->getTurnaroundTime()) : "N/A";
+        std::string waiting = simulatedProcess ? std::to_string(simulatedProcess->getWaitingTime()) : "N/A";
 
         LVITEMA item{};
         item.mask = LVIF_TEXT;
@@ -479,10 +858,15 @@ static void PopulateProcessList(const ParsedSchedule& parsed) {
         ListView_SetItemText(g_hProcessList, row, 3, const_cast<char*>(queueId.c_str()));
         ListView_SetItemText(g_hProcessList, row, 4, const_cast<char*>(timeSlice.c_str()));
         ListView_SetItemText(g_hProcessList, row, 5, const_cast<char*>(algorithm.c_str()));
+        ListView_SetItemText(g_hProcessList, row, 6, const_cast<char*>(completion.c_str()));
+        ListView_SetItemText(g_hProcessList, row, 7, const_cast<char*>(turnaround.c_str()));
+        ListView_SetItemText(g_hProcessList, row, 8, const_cast<char*>(waiting.c_str()));
     }
 }
 
 static void ShowSelectedFileInfo(int index) {
+    ClearProcessHighlight();
+
     if (!g_hasLoadedDrive) {
         SetStatusText("Click Scan first, then select a .txt file to preview.");
         return;
@@ -511,6 +895,10 @@ static void ShowSelectedFileInfo(int index) {
     SendMessageA(g_hContentEdit, EM_SCROLLCARET, 0, 0);
 
     ParsedSchedule parsed = ParseScheduleText(content);
+    SimulationResult simulation;
+    if (parsed.ok) {
+        simulation = RunScheduleSimulation(parsed);
+    }
 
     std::ostringstream detail;
     detail << "Name: " << file.name << "\r\n"
@@ -525,20 +913,31 @@ static void ShowSelectedFileInfo(int index) {
 
     if (parsed.ok) {
         detail << "Queue count: " << parsed.queueCount << "\r\n"
-               << "Process count: " << parsed.processes.size() << "\r\n";
+               << "Process count: " << parsed.processes.size() << "\r\n"
+               << BuildSimulationSummary(simulation);
     } else {
         detail << "Schedule parse: " << parsed.error << "\r\n";
     }
 
-    SetWindowTextA(g_hDetailEdit, detail.str().c_str());
-    SendMessageA(g_hDetailEdit, EM_SETSEL, 0, 0);
-    SendMessageA(g_hDetailEdit, EM_SCROLLCARET, 0, 0);
+    g_currentDetailBase = detail.str();
 
     if (parsed.ok) {
-        PopulateProcessList(parsed);
-        SetStatusText("Loaded the selected file content.");
+        g_currentSchedule = parsed;
+        g_currentSimulation = simulation;
+        g_hasSimulationData = simulation.ok;
+        g_ganttScrollX = 0;
+        PopulateProcessList(parsed, &simulation);
+        UpdateGanttScrollInfo();
+        RefreshSimulationView();
+        SetStatusText("Loaded the selected file content and displayed the final schedule.");
     } else {
+        g_currentSchedule = ParsedSchedule{};
+        g_currentSimulation = SimulationResult{};
+        g_hasSimulationData = false;
+        g_ganttScrollX = 0;
         ClearProcessList();
+        UpdateGanttScrollInfo();
+        RefreshSimulationView();
         SetStatusText("Opened the .txt file, but the scheduling content does not match the expected format.");
     }
 }
@@ -579,6 +978,7 @@ static std::vector<std::string> GetAvailableDrives() {
 }
 
 static void ResetLoadedData(bool keepStatus = false) {
+    ClearProcessHighlight();
     if (g_reader.isOpen()) {
         g_reader.close();
     }
@@ -586,7 +986,13 @@ static void ResetLoadedData(bool keepStatus = false) {
     SendMessageA(g_hFileList, LB_RESETCONTENT, 0, 0);
     ClearFileViews();
     g_txtFiles.clear();
+    g_currentSchedule = ParsedSchedule{};
+    g_currentSimulation = SimulationResult{};
+    g_currentDetailBase.clear();
+    g_hasSimulationData = false;
+    g_ganttScrollX = 0;
     g_hasLoadedDrive = false;
+    RefreshSimulationView();
     if (!keepStatus) {
         SetStatusText("Choose a drive, then click Scan.");
     }
@@ -713,6 +1119,14 @@ static void CreateChildControls(HWND hwnd) {
         WS_VSCROLL | WS_HSCROLL | ES_READONLY,
         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_CONTENT_EDIT), GetModuleHandle(nullptr), nullptr);
 
+    g_hGanttLabel = CreateWindowExA(0, "STATIC", "Gantt Chart",
+        WS_CHILD | WS_VISIBLE,
+        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GANTT_LABEL), GetModuleHandle(nullptr), nullptr);
+
+    g_hGanttChart = CreateWindowExA(WS_EX_CLIENTEDGE, kGanttChartClass, "",
+        WS_CHILD | WS_VISIBLE | WS_HSCROLL,
+        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GANTT_CHART), GetModuleHandle(nullptr), nullptr);
+
     g_hProcessLabel = CreateWindowExA(0, "STATIC", "Scheduling Table",
         WS_CHILD | WS_VISIBLE,
         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_PROCESS_LABEL), GetModuleHandle(nullptr), nullptr);
@@ -753,12 +1167,16 @@ static void CreateChildControls(HWND hwnd) {
     AddColumn(g_hProcessList, 3, 110, "Queue ID");
     AddColumn(g_hProcessList, 4, 100, "Time Slice");
     AddColumn(g_hProcessList, 5, 150, "Algorithm");
+    AddColumn(g_hProcessList, 6, 100, "Completion");
+    AddColumn(g_hProcessList, 7, 110, "Turnaround");
+    AddColumn(g_hProcessList, 8, 90, "Waiting");
     ResizeProcessColumns();
 
     g_hFontUI = CreateAppFont(11, FW_NORMAL, "Segoe UI");
     g_hFontLabel = CreateAppFont(11, FW_SEMIBOLD, "Segoe UI");
     g_hFontMono = CreateAppFont(10, FW_NORMAL, "Consolas");
     ApplyFontsToChildren(hwnd);
+
 }
 
 static void LayoutControls(HWND hwnd) {
@@ -785,16 +1203,16 @@ static void LayoutControls(HWND hwnd) {
 
     int bootAreaH = contentH * 35 / 100;
     int fileAreaH = contentH - bootAreaH - gap;
-    int detailAreaH = 140;
-    int contentAreaH = 200;
-    int processAreaH = contentH - detailAreaH - contentAreaH - sectionGap * 2;
-    if (processAreaH < 160) processAreaH = 160;
+    int detailAreaH = 128;
+    int contentAreaH = 160;
+    int ganttAreaH = 170;
+    int processAreaH = contentH - detailAreaH - contentAreaH - ganttAreaH - sectionGap * 3;
+    if (processAreaH < 150) processAreaH = 150;
 
     const int comboW = 160;
     const int topGap = 8;
     const int refreshW = 96;
     const int scanW = 84;
-
     MoveWindow(g_hDriveCombo, margin, margin, comboW, topHeight, TRUE);
     MoveWindow(GetDlgItem(hwnd, IDC_REFRESH_BTN), margin + comboW + topGap, margin, refreshW, topHeight, TRUE);
     MoveWindow(GetDlgItem(hwnd, IDC_LOAD_BTN), margin + comboW + topGap + refreshW + topGap, margin, scanW, topHeight, TRUE);
@@ -815,7 +1233,12 @@ static void LayoutControls(HWND hwnd) {
     MoveWindow(g_hContentLabel, rightX, contentY, rightW, labelHeight, TRUE);
     MoveWindow(g_hContentEdit, rightX, contentY + labelHeight, rightW, contentAreaH - labelHeight, TRUE);
 
-    int processY = contentY + contentAreaH + sectionGap;
+    int ganttY = contentY + contentAreaH + sectionGap;
+    MoveWindow(g_hGanttLabel, rightX, ganttY, rightW, labelHeight, TRUE);
+    MoveWindow(g_hGanttChart, rightX, ganttY + labelHeight, rightW, ganttAreaH - labelHeight, TRUE);
+    UpdateGanttScrollInfo();
+
+    int processY = ganttY + ganttAreaH + sectionGap;
     int remainingH = usableBottom - processY;
     if (remainingH > labelHeight + 40) {
         processAreaH = remainingH;
@@ -869,6 +1292,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_HSCROLL:
+        if (reinterpret_cast<HWND>(lParam) == g_hGanttChart && HandleGanttHScroll(g_hGanttChart, wParam)) {
+            return 0;
+        }
+        break;
+
     case WM_NOTIFY: {
         NMHDR* hdr = reinterpret_cast<NMHDR*>(lParam);
         HWND processHeader = g_hProcessList ? ListView_GetHeader(g_hProcessList) : nullptr;
@@ -898,7 +1327,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         SetBkMode(hdc, TRANSPARENT);
         if (hCtrl == g_hBootLabel || hCtrl == g_hFileLabel || hCtrl == g_hDetailLabel ||
-            hCtrl == g_hContentLabel || hCtrl == g_hProcessLabel) {
+            hCtrl == g_hContentLabel || hCtrl == g_hGanttLabel || hCtrl == g_hProcessLabel) {
             SetTextColor(hdc, kColorTextMain);
             return reinterpret_cast<INT_PTR>(g_hMainBrush);
         }
@@ -945,6 +1374,16 @@ static int RunGui(HINSTANCE hInstance, int nCmdShow, const std::string& initialD
 
     g_hMainBrush = CreateSolidBrush(kColorWindowBg);
     g_hCardBrush = CreateSolidBrush(kColorCardBg);
+
+    WNDCLASSEXA ganttClass{};
+    ganttClass.cbSize = sizeof(ganttClass);
+    ganttClass.lpfnWndProc = GanttChartProc;
+    ganttClass.hInstance = hInstance;
+    ganttClass.lpszClassName = kGanttChartClass;
+    ganttClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    ganttClass.hbrBackground = nullptr;
+    ganttClass.style = CS_HREDRAW | CS_VREDRAW;
+    RegisterClassExA(&ganttClass);
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);

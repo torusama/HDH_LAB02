@@ -67,7 +67,7 @@ uint32_t BootSector::getRootCluster() const {
 }
 
 uint32_t BootSector::getRDETSectors() const {
-    return _raw.BPB_SecPerClus;
+    return 0;
 }
 
  uint64_t BootSector::getFATStartSector() const {
