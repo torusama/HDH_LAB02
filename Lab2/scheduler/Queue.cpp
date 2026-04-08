@@ -1,3 +1,4 @@
+#include <climits>
 #include "Queue.h"
 
 Queue::Queue() {

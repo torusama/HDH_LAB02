@@ -411,7 +411,7 @@ static void ClearProcessHighlight() {
 
 static void RedrawGanttChart() {
     if (g_hGanttChart) {
-        InvalidateRect(g_hGanttChart, nullptr, TRUE);
+        InvalidateRect(g_hGanttChart, nullptr, FALSE);
         UpdateWindow(g_hGanttChart);
     }
 }
@@ -492,9 +492,14 @@ static bool HandleGanttHScroll(HWND hwnd, WPARAM wParam) {
     }
 
     const int maxScroll = std::max(0, si.nMax - static_cast<int>(si.nPage) + 1);
+    const int oldScrollX = g_ganttScrollX;
     g_ganttScrollX = std::clamp(newPos, 0, maxScroll);
     SetScrollPos(hwnd, SB_HORZ, g_ganttScrollX, TRUE);
-    RedrawGanttChart();
+
+    if (g_ganttScrollX != oldScrollX) {
+        InvalidateRect(hwnd, nullptr, FALSE);
+        UpdateWindow(hwnd);
+    }
     return true;
 }
 
@@ -790,7 +795,26 @@ static LRESULT CALLBACK GanttChartProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT rc{};
         GetClientRect(hwnd, &rc);
-        PaintGanttChart(hdc, rc);
+
+        const int width = std::max(1, static_cast<int>(rc.right - rc.left));
+        const int height = std::max(1, static_cast<int>(rc.bottom - rc.top));
+        HDC memDc = CreateCompatibleDC(hdc);
+        HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
+
+        if (memDc && memBitmap) {
+            HBITMAP oldBitmap = static_cast<HBITMAP>(SelectObject(memDc, memBitmap));
+            PaintGanttChart(memDc, rc);
+            BitBlt(hdc, ps.rcPaint.left, ps.rcPaint.top,
+                   ps.rcPaint.right - ps.rcPaint.left,
+                   ps.rcPaint.bottom - ps.rcPaint.top,
+                   memDc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+            SelectObject(memDc, oldBitmap);
+        } else {
+            PaintGanttChart(hdc, rc);
+        }
+
+        if (memBitmap) DeleteObject(memBitmap);
+        if (memDc) DeleteDC(memDc);
         EndPaint(hwnd, &ps);
         return 0;
     }
