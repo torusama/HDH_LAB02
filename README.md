@@ -150,6 +150,6 @@ and then build again.
 ## Quick Build And Run Example
 
 ```powershell
-g++ main_gui.cpp fat32/BootSector.cpp fat32/DiskReader.cpp fat32/FATTable.cpp fat32/DirectoryEntry.cpp -std=c++17 -mwindows -lcomctl32 -o lab2_gui.exe
+g++ main_gui.cpp fat32/BootSector.cpp fat32/DiskReader.cpp fat32/FATTable.cpp fat32/DirectoryEntry.cpp scheduler/Process.cpp scheduler/Queue.cpp scheduler/Scheduler.cpp -std=c++17 -mwindows -lcomctl32 -o lab2_gui.exe
 .\lab2_gui.exe
 ```
