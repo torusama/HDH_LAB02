@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <functional>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include "fat32/DiskReader.h"
 #include "fat32/BootSector.h"
@@ -57,6 +58,9 @@ enum ControlId {
     IDC_LOAD_BTN,
     IDC_BOOT_LIST,
     IDC_FILE_LIST,
+    IDC_RIGHT_TABS,
+    IDC_RIGHT_TAB_FILE_BTN,
+    IDC_RIGHT_TAB_SCHEDULE_BTN,
     IDC_DETAIL_EDIT,
     IDC_CONTENT_EDIT,
     IDC_PROCESS_LIST,
@@ -72,8 +76,15 @@ enum ControlId {
 
 static HWND g_hMainWnd = nullptr;
 static HWND g_hDriveCombo = nullptr;
+static HWND g_hRefreshBtn = nullptr;
+static HWND g_hScanBtn = nullptr;
 static HWND g_hBootList = nullptr;
 static HWND g_hFileList = nullptr;
+static HWND g_hRightTabs = nullptr;
+static HWND g_hRightTabFileBtn = nullptr;
+static HWND g_hRightTabScheduleBtn = nullptr;
+static HWND g_hFileTabPage = nullptr;
+static HWND g_hScheduleTabPage = nullptr;
 static HWND g_hDetailEdit = nullptr;
 static HWND g_hContentEdit = nullptr;
 static HWND g_hProcessList = nullptr;
@@ -104,13 +115,48 @@ static SimulationResult g_currentSimulation;
 static std::string g_currentDetailBase;
 static bool g_hasSimulationData = false;
 static int g_ganttScrollX = 0;
+static int g_activeRightTab = 0;
+static HBITMAP g_hGanttCanvasBitmap = nullptr;
+static int g_ganttCanvasWidth = 0;
+static int g_ganttCanvasHeight = 0;
+static bool g_ganttCanvasDirty = true;
 
 static const char* kAppTitle = "Lab 2 | FAT32 Schedule Explorer";
 static const char* kGanttChartClass = "Lab2GanttChartView";
+static const char* kRightTabPageClass = "Lab2RightTabPage";
+static const char* kActionButtonClass = "Lab2ActionButton";
 static const COLORREF kColorWindowBg = RGB(245, 247, 250);
 static const COLORREF kColorCardBg = RGB(255, 255, 255);
 static const COLORREF kColorTextMain = RGB(32, 32, 32);
 static const COLORREF kColorTextMuted = RGB(96, 96, 96);
+static const COLORREF kColorTabActiveBg = RGB(68, 128, 171);
+static const COLORREF kColorTabActiveBorder = RGB(45, 96, 136);
+static const COLORREF kColorTabInactiveBg = RGB(250, 251, 253);
+static const COLORREF kColorTabInactiveBorder = RGB(210, 216, 224);
+static const COLORREF kColorTabInactiveText = RGB(72, 72, 72);
+static const COLORREF kColorRefreshBtnBg = RGB(236, 242, 248);
+static const COLORREF kColorRefreshBtnBorder = RGB(168, 184, 201);
+static const COLORREF kColorRefreshBtnPressed = RGB(205, 220, 235);
+static const COLORREF kColorRefreshBtnText = RGB(52, 74, 94);
+static const COLORREF kColorRefreshBtnHover = RGB(226, 235, 244);
+static const COLORREF kColorScanBtnBg = RGB(72, 156, 120);
+static const COLORREF kColorScanBtnBorder = RGB(51, 118, 89);
+static const COLORREF kColorScanBtnPressed = RGB(58, 132, 101);
+static const COLORREF kColorScanBtnText = RGB(255, 255, 255);
+static const COLORREF kColorScanBtnHover = RGB(82, 169, 132);
+
+enum RightTabIndex {
+    RIGHT_TAB_FILE_VIEW = 0,
+    RIGHT_TAB_SCHEDULE_VIEW = 1
+};
+
+enum ActionButtonStateFlags {
+    ACTIONBTN_HOVER = 0x01,
+    ACTIONBTN_PRESSED = 0x02
+};
+
+static void LayoutControls(HWND hwnd);
+static void RedrawProcessTableHeader();
 
 static const QueueInfo* FindQueueById(const std::vector<QueueInfo>& queues, const std::string& queueId) {
     for (const auto& q : queues) {
@@ -133,6 +179,20 @@ static COLORREF ColorFromKey(const std::string& key) {
     const int g = 110 + static_cast<int>((value >> 6) & 0x5F);
     const int b = 120 + static_cast<int>((value >> 13) & 0x5F);
     return RGB(r, g, b);
+}
+
+static COLORREF AdjustColor(COLORREF color, int delta) {
+    int r = std::clamp(static_cast<int>(GetRValue(color)) + delta, 0, 255);
+    int g = std::clamp(static_cast<int>(GetGValue(color)) + delta, 0, 255);
+    int b = std::clamp(static_cast<int>(GetBValue(color)) + delta, 0, 255);
+    return RGB(r, g, b);
+}
+
+static COLORREF GetContrastingTextColor(COLORREF background) {
+    const int luminance = (299 * GetRValue(background) +
+                           587 * GetGValue(background) +
+                           114 * GetBValue(background)) / 1000;
+    return (luminance >= 150) ? RGB(32, 32, 32) : RGB(255, 255, 255);
 }
 
 static std::string ToWindowsNewlines(const std::string& text) {
@@ -300,10 +360,270 @@ static void ApplyControlFont(HWND hWnd, HFONT hFont) {
     }
 }
 
-static void ApplyFontsToChildren(HWND hwnd) {
+static HBRUSH ApplySharedControlColors(HWND hCtrl, HDC hdc) {
+    if (!hdc) return nullptr;
+
+    if (hCtrl == g_hDetailEdit || hCtrl == g_hContentEdit) {
+        SetBkColor(hdc, kColorCardBg);
+        SetTextColor(hdc, kColorTextMain);
+        return g_hCardBrush;
+    }
+
+    SetBkMode(hdc, TRANSPARENT);
+    if (hCtrl == g_hBootLabel || hCtrl == g_hFileLabel || hCtrl == g_hDetailLabel ||
+        hCtrl == g_hContentLabel || hCtrl == g_hGanttLabel || hCtrl == g_hProcessLabel) {
+        SetTextColor(hdc, kColorTextMain);
+        return g_hMainBrush;
+    }
+    if (hCtrl == g_hStatusText) {
+        SetTextColor(hdc, kColorTextMuted);
+        return g_hMainBrush;
+    }
+    return g_hMainBrush;
+}
+
+static void SetControlVisibility(HWND hWnd, bool visible) {
+    if (hWnd) {
+        ShowWindow(hWnd, visible ? SW_SHOW : SW_HIDE);
+    }
+}
+
+static RECT GetRightTabPageRect(HWND hContainer) {
+    RECT rc{};
+    if (!hContainer) return rc;
+
+    GetClientRect(hContainer, &rc);
+    const int padding = 4;
+    const int buttonHeight = 40;
+    const int buttonTop = 6;
+    const int gapBelowButtons = 8;
+    rc.left += padding;
+    rc.right -= padding;
+    rc.top = buttonTop + buttonHeight + gapBelowButtons;
+    rc.bottom -= padding;
+    return rc;
+}
+
+static void UpdateRightTabVisibility() {
+    bool showFileView = (g_activeRightTab == RIGHT_TAB_FILE_VIEW);
+    SetControlVisibility(g_hFileTabPage, showFileView);
+    SetControlVisibility(g_hScheduleTabPage, !showFileView);
+
+    if (g_hRightTabFileBtn) InvalidateRect(g_hRightTabFileBtn, nullptr, TRUE);
+    if (g_hRightTabScheduleBtn) InvalidateRect(g_hRightTabScheduleBtn, nullptr, TRUE);
+
+    HWND activePage = showFileView ? g_hFileTabPage : g_hScheduleTabPage;
+    if (activePage) {
+        SetWindowPos(activePage, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(activePage, nullptr, TRUE);
+        UpdateWindow(activePage);
+    }
+}
+
+static void ActivateRightTab(int tabIndex) {
+    int clampedTab = (tabIndex == RIGHT_TAB_SCHEDULE_VIEW) ? RIGHT_TAB_SCHEDULE_VIEW : RIGHT_TAB_FILE_VIEW;
+    if (g_activeRightTab == clampedTab) {
+        if (g_hRightTabs) InvalidateRect(g_hRightTabs, nullptr, TRUE);
+        return;
+    }
+
+    g_activeRightTab = clampedTab;
+    if (g_hMainWnd) {
+        LayoutControls(g_hMainWnd);
+    }
+    if (g_activeRightTab == RIGHT_TAB_SCHEDULE_VIEW) {
+        RedrawProcessTableHeader();
+    }
+}
+
+static void RedrawProcessTableHeader() {
+    if (!g_hProcessList) return;
+
+    HWND hHeader = ListView_GetHeader(g_hProcessList);
+    RedrawWindow(g_hProcessList, nullptr, nullptr,
+        RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    if (hHeader) {
+        RedrawWindow(hHeader, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
+    }
+}
+
+static void DrawRightTabButton(const DRAWITEMSTRUCT* dis) {
+    if (!dis) return;
+
+    HDC hdc = dis->hDC;
+    RECT rect = dis->rcItem;
+    bool isSelected = false;
+    if (dis->CtlID == IDC_RIGHT_TAB_FILE_BTN) {
+        isSelected = (g_activeRightTab == RIGHT_TAB_FILE_VIEW);
+    } else if (dis->CtlID == IDC_RIGHT_TAB_SCHEDULE_BTN) {
+        isSelected = (g_activeRightTab == RIGHT_TAB_SCHEDULE_VIEW);
+    }
+
+    int insetX = 4;
+    int insetTop = 4;
+    int insetBottom = 4;
+    RECT buttonRect{
+        rect.left + insetX,
+        rect.top + insetTop,
+        rect.right - insetX,
+        rect.bottom - insetBottom
+    };
+
+    COLORREF fillColor = isSelected ? kColorTabActiveBg : kColorTabInactiveBg;
+    COLORREF borderColor = isSelected ? kColorTabActiveBorder : kColorTabInactiveBorder;
+    COLORREF textColor = isSelected ? RGB(255, 255, 255) : kColorTabInactiveText;
+
+    HBRUSH fillBrush = CreateSolidBrush(fillColor);
+    HPEN borderPen = CreatePen(PS_SOLID, 1, borderColor);
+    HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, fillBrush));
+    HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, borderPen));
+    SetBkMode(hdc, TRANSPARENT);
+    RoundRect(hdc, buttonRect.left, buttonRect.top, buttonRect.right, buttonRect.bottom, 12, 12);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(fillBrush);
+    DeleteObject(borderPen);
+
+    char textBuffer[128]{};
+    GetWindowTextA(dis->hwndItem, textBuffer, static_cast<int>(sizeof(textBuffer)));
+
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_hFontLabel ? g_hFontLabel : g_hFontUI));
+    SetTextColor(hdc, textColor);
+    RECT textRect = buttonRect;
+    DrawTextA(hdc, textBuffer, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, oldFont);
+}
+
+static void DrawActionButton(const DRAWITEMSTRUCT* dis) {
+    if (!dis) return;
+
+    HDC hdc = dis->hDC;
+    RECT rect = dis->rcItem;
+    bool isPressed = (dis->itemState & ODS_SELECTED) != 0;
+    bool isDisabled = (dis->itemState & ODS_DISABLED) != 0;
+    bool isScan = (dis->CtlID == IDC_LOAD_BTN);
+
+    COLORREF fillColor = isScan ? kColorScanBtnBg : kColorRefreshBtnBg;
+    COLORREF borderColor = isScan ? kColorScanBtnBorder : kColorRefreshBtnBorder;
+    COLORREF textColor = isScan ? kColorScanBtnText : kColorRefreshBtnText;
+    COLORREF pressedColor = isScan ? kColorScanBtnPressed : kColorRefreshBtnPressed;
+
+    if (isPressed) {
+        fillColor = pressedColor;
+    }
+    if (isDisabled) {
+        fillColor = AdjustColor(fillColor, 18);
+        borderColor = AdjustColor(borderColor, 30);
+        textColor = RGB(150, 150, 150);
+    }
+
+    HBRUSH fillBrush = CreateSolidBrush(fillColor);
+    HPEN borderPen = CreatePen(PS_SOLID, 1, borderColor);
+    HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, fillBrush));
+    HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, borderPen));
+    SetBkMode(hdc, TRANSPARENT);
+
+    RECT buttonRect = rect;
+    InflateRect(&buttonRect, -1, -1);
+    if (isPressed) {
+        OffsetRect(&buttonRect, 0, 1);
+    }
+    RoundRect(hdc, buttonRect.left, buttonRect.top, buttonRect.right, buttonRect.bottom, 12, 12);
+
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(fillBrush);
+    DeleteObject(borderPen);
+
+    char textBuffer[128]{};
+    GetWindowTextA(dis->hwndItem, textBuffer, static_cast<int>(sizeof(textBuffer)));
+
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_hFontLabel ? g_hFontLabel : g_hFontUI));
+    SetTextColor(hdc, textColor);
+    RECT textRect = buttonRect;
+    if (isPressed) {
+        OffsetRect(&textRect, 0, 1);
+    }
+    DrawTextA(hdc, textBuffer, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, oldFont);
+
+    if ((dis->itemState & ODS_FOCUS) != 0) {
+        RECT focusRect = buttonRect;
+        InflateRect(&focusRect, -8, -8);
+        DrawFocusRect(hdc, &focusRect);
+    }
+}
+
+static void PaintActionButton(HWND hwnd, HDC hdc) {
+    if (!hwnd || !hdc) return;
+
+    RECT rect{};
+    GetClientRect(hwnd, &rect);
+    int state = static_cast<int>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    bool isPressed = (state & ACTIONBTN_PRESSED) != 0;
+    bool isHover = (state & ACTIONBTN_HOVER) != 0;
+    bool isDisabled = !IsWindowEnabled(hwnd);
+    bool isScan = (GetDlgCtrlID(hwnd) == IDC_LOAD_BTN);
+
+    COLORREF fillColor = isScan ? kColorScanBtnBg : kColorRefreshBtnBg;
+    COLORREF borderColor = isScan ? kColorScanBtnBorder : kColorRefreshBtnBorder;
+    COLORREF textColor = isScan ? kColorScanBtnText : kColorRefreshBtnText;
+    COLORREF hoverColor = isScan ? kColorScanBtnHover : kColorRefreshBtnHover;
+    COLORREF pressedColor = isScan ? kColorScanBtnPressed : kColorRefreshBtnPressed;
+
+    if (isPressed) {
+        fillColor = pressedColor;
+    } else if (isHover) {
+        fillColor = hoverColor;
+    }
+    if (isDisabled) {
+        fillColor = AdjustColor(fillColor, 18);
+        borderColor = AdjustColor(borderColor, 24);
+        textColor = RGB(150, 150, 150);
+    }
+
+    HBRUSH bgBrush = CreateSolidBrush(kColorWindowBg);
+    FillRect(hdc, &rect, bgBrush);
+    DeleteObject(bgBrush);
+
+    HBRUSH fillBrush = CreateSolidBrush(fillColor);
+    HPEN borderPen = CreatePen(PS_SOLID, 1, borderColor);
+    HBRUSH oldBrush = static_cast<HBRUSH>(SelectObject(hdc, fillBrush));
+    HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, borderPen));
+    SetBkMode(hdc, TRANSPARENT);
+
+    RECT buttonRect = rect;
+    InflateRect(&buttonRect, -1, -1);
+    if (isPressed) {
+        OffsetRect(&buttonRect, 0, 1);
+    }
+    RoundRect(hdc, buttonRect.left, buttonRect.top, buttonRect.right, buttonRect.bottom, 12, 12);
+
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(fillBrush);
+    DeleteObject(borderPen);
+
+    char textBuffer[128]{};
+    GetWindowTextA(hwnd, textBuffer, static_cast<int>(sizeof(textBuffer)));
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_hFontLabel ? g_hFontLabel : g_hFontUI));
+    SetTextColor(hdc, textColor);
+    RECT textRect = buttonRect;
+    if (isPressed) {
+        OffsetRect(&textRect, 0, 1);
+    }
+    DrawTextA(hdc, textBuffer, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, oldFont);
+}
+
+static void ApplyFontsToChildren(HWND) {
     ApplyControlFont(g_hDriveCombo, g_hFontUI);
-    ApplyControlFont(GetDlgItem(hwnd, IDC_REFRESH_BTN), g_hFontUI);
-    ApplyControlFont(GetDlgItem(hwnd, IDC_LOAD_BTN), g_hFontUI);
+    ApplyControlFont(g_hRefreshBtn, g_hFontUI);
+    ApplyControlFont(g_hScanBtn, g_hFontUI);
+    ApplyControlFont(g_hRightTabFileBtn, g_hFontLabel ? g_hFontLabel : g_hFontUI);
+    ApplyControlFont(g_hRightTabScheduleBtn, g_hFontLabel ? g_hFontLabel : g_hFontUI);
     ApplyControlFont(g_hBootLabel, g_hFontLabel);
     ApplyControlFont(g_hFileLabel, g_hFontLabel);
     ApplyControlFont(g_hDetailLabel, g_hFontLabel);
@@ -316,6 +636,8 @@ static void ApplyFontsToChildren(HWND hwnd) {
     ApplyControlFont(g_hContentEdit, g_hFontMono);
     ApplyControlFont(g_hProcessList, g_hFontUI);
     ApplyControlFont(g_hStatusText, g_hFontUI);
+    ApplyControlFont(g_hBootList ? ListView_GetHeader(g_hBootList) : nullptr, g_hFontUI);
+    ApplyControlFont(g_hProcessList ? ListView_GetHeader(g_hProcessList) : nullptr, g_hFontUI);
 }
 
 static void AddColumn(HWND hList, int index, int width, const char* title) {
@@ -330,14 +652,14 @@ static void AddColumn(HWND hList, int index, int width, const char* title) {
 static void ResizeProcessColumns() {
     if (!g_hProcessList) return;
 
-    HWND hHeader = ListView_GetHeader(g_hProcessList);
     RECT rc{};
-    if (hHeader) {
-        GetClientRect(hHeader, &rc);
-    } else {
-        GetClientRect(g_hProcessList, &rc);
-    }
+    GetClientRect(g_hProcessList, &rc);
     int totalWidth = rc.right - rc.left;
+    if (totalWidth <= 0) return;
+
+    if ((GetWindowLongA(g_hProcessList, GWL_STYLE) & WS_VSCROLL) != 0) {
+        totalWidth -= GetSystemMetrics(SM_CXVSCROLL);
+    }
     if (totalWidth <= 0) return;
 
     const int columnCount = 9;
@@ -352,6 +674,8 @@ static void ResizeProcessColumns() {
         }
         ListView_SetColumnWidth(g_hProcessList, i, width);
     }
+
+    RedrawProcessTableHeader();
 }
 
 static void ResizeBootColumns() {
@@ -392,12 +716,30 @@ static void ClearProcessList() {
     ListView_DeleteAllItems(g_hProcessList);
 }
 
+static void DestroyGanttCanvasCache() {
+    if (g_hGanttCanvasBitmap) {
+        DeleteObject(g_hGanttCanvasBitmap);
+        g_hGanttCanvasBitmap = nullptr;
+    }
+    g_ganttCanvasWidth = 0;
+    g_ganttCanvasHeight = 0;
+    g_ganttCanvasDirty = true;
+}
+
+static void InvalidateGanttCanvasCache(bool destroyBitmap = false) {
+    g_ganttCanvasDirty = true;
+    if (destroyBitmap) {
+        DestroyGanttCanvasCache();
+    }
+}
+
 static void ClearFileViews() {
     SetWindowTextA(g_hDetailEdit, "");
     SetWindowTextA(g_hContentEdit, "");
     SendMessageA(g_hDetailEdit, EM_SETSEL, 0, 0);
     SendMessageA(g_hContentEdit, EM_SETSEL, 0, 0);
     ClearProcessList();
+    InvalidateGanttCanvasCache(true);
 }
 
 static void ClearProcessHighlight() {
@@ -424,11 +766,24 @@ static int GetTimelineEndTime() {
     return std::max(totalEndTime, 1);
 }
 
+static int GetGanttPixelsPerTimeUnit() {
+    return 96;
+}
+
+static int GetGanttWorldLeftPadding() {
+    return 72;
+}
+
+static int GetGanttWorldRightPadding() {
+    return 56;
+}
+
 static int GetGanttContentWidth() {
     const int totalEndTime = GetTimelineEndTime();
-    const int widthFromTime = totalEndTime * 56;
-    const int widthFromEvents = static_cast<int>(g_currentSimulation.timeline.size()) * 72;
-    return std::max(900, std::max(widthFromTime, widthFromEvents));
+    const int widthFromTime = totalEndTime * GetGanttPixelsPerTimeUnit();
+    const int widthFromEvents = static_cast<int>(g_currentSimulation.timeline.size()) * 120;
+    return GetGanttWorldLeftPadding() + GetGanttWorldRightPadding() +
+           std::max(1100, std::max(widthFromTime, widthFromEvents));
 }
 
 static void UpdateGanttScrollInfo() {
@@ -438,7 +793,7 @@ static void UpdateGanttScrollInfo() {
     GetClientRect(g_hGanttChart, &rc);
     const int viewportWidth = std::max(1, static_cast<int>(rc.right - rc.left));
     const int contentWidth = (g_hasSimulationData && g_currentSimulation.ok && !g_currentSimulation.timeline.empty())
-        ? GetGanttContentWidth()
+        ? std::max(GetGanttContentWidth(), viewportWidth)
         : viewportWidth;
 
     const int maxScroll = std::max(0, contentWidth - viewportWidth);
@@ -657,7 +1012,19 @@ static void RefreshDetailPane() {
     SendMessageA(g_hDetailEdit, EM_SCROLLCARET, 0, 0);
 }
 
-static void PaintGanttChart(HDC hdc, const RECT& clientRect) {
+static RECT GetGanttInnerRect(const RECT& clientRect) {
+    RECT inner = clientRect;
+    InflateRect(&inner, -14, -12);
+    return inner;
+}
+
+static RECT GetGanttCanvasViewportRect(const RECT& clientRect) {
+    RECT viewport = GetGanttInnerRect(clientRect);
+    viewport.top += 28;
+    return viewport;
+}
+
+static void PaintGanttChartFrame(HDC hdc, const RECT& clientRect) {
     HBRUSH bgBrush = CreateSolidBrush(kColorCardBg);
     FillRect(hdc, &clientRect, bgBrush);
     DeleteObject(bgBrush);
@@ -672,48 +1039,76 @@ static void PaintGanttChart(HDC hdc, const RECT& clientRect) {
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, kColorTextMain);
+}
 
-    RECT inner = clientRect;
-    InflateRect(&inner, -14, -12);
-    if (inner.right <= inner.left || inner.bottom <= inner.top) return;
+static void PaintGanttCanvas(HDC hdc, const RECT& canvasRect) {
+    HBRUSH bgBrush = CreateSolidBrush(kColorCardBg);
+    FillRect(hdc, &canvasRect, bgBrush);
+    DeleteObject(bgBrush);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, kColorTextMain);
+    HPEN oldPen = nullptr;
+    HBRUSH oldBrush = nullptr;
+
+    if (canvasRect.right <= canvasRect.left || canvasRect.bottom <= canvasRect.top) return;
 
     if (!g_hasSimulationData || !g_currentSimulation.ok || g_currentSimulation.timeline.empty()) {
-        DrawTextA(hdc, "Load a valid schedule to see the Gantt chart.", -1,
-                  &inner, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         return;
     }
 
     const int totalEndTime = GetTimelineEndTime();
     const int contentWidth = GetGanttContentWidth();
-    const int axisLeftWorld = 44;
-    const int axisRightWorld = contentWidth - 36;
-    const int axisTop = inner.top + 26;
-    const int axisBottom = inner.bottom - 30;
+    const int axisLeftWorld = GetGanttWorldLeftPadding();
+    const int axisRightWorld = contentWidth - GetGanttWorldRightPadding();
+    const int axisTop = canvasRect.top + 12;
+    const int axisBottom = canvasRect.bottom - 34;
     const int axisWidthWorld = std::max(1, axisRightWorld - axisLeftWorld);
-    const int barHeight = std::min(52, std::max(32, axisBottom - axisTop - 16));
+    const int barHeight = std::min(68, std::max(48, axisBottom - axisTop - 18));
     const int barTop = axisTop + std::max(0, (axisBottom - axisTop - barHeight) / 2);
     const int barBottom = barTop + barHeight;
-    const int axisY = barBottom + 10;
+    const int axisY = barBottom + 12;
 
-    int axisLeft = inner.left + axisLeftWorld - g_ganttScrollX;
-    int axisRight = inner.left + axisRightWorld - g_ganttScrollX;
+    int axisLeft = canvasRect.left + axisLeftWorld;
+    int axisRight = canvasRect.left + axisRightWorld;
+
+    HBRUSH stripeBrush = CreateSolidBrush(RGB(248, 250, 252));
+    HPEN gridPen = CreatePen(PS_SOLID, 1, RGB(228, 232, 238));
+    HPEN oldGridPen = static_cast<HPEN>(SelectObject(hdc, gridPen));
+
+    for (int timeValue = 0; timeValue < totalEndTime; ++timeValue) {
+        int x1 = canvasRect.left + axisLeftWorld + (timeValue * axisWidthWorld) / totalEndTime;
+        int x2 = canvasRect.left + axisLeftWorld + ((timeValue + 1) * axisWidthWorld) / totalEndTime;
+
+        if (timeValue % 2 == 1) {
+            RECT stripeRect{ x1, axisTop - 6, x2, axisY };
+            if (stripeRect.right > stripeRect.left) {
+                FillRect(hdc, &stripeRect, stripeBrush);
+            }
+        }
+
+        MoveToEx(hdc, x1, axisTop - 6, nullptr);
+        LineTo(hdc, x1, axisY + 1);
+    }
+
+    MoveToEx(hdc, axisRight, axisTop - 6, nullptr);
+    LineTo(hdc, axisRight, axisY + 1);
+
+    SelectObject(hdc, oldGridPen);
+    DeleteObject(gridPen);
+    DeleteObject(stripeBrush);
 
     HPEN axisPen = CreatePen(PS_SOLID, 1, RGB(170, 176, 186));
     oldPen = static_cast<HPEN>(SelectObject(hdc, axisPen));
     MoveToEx(hdc, axisLeft, axisY, nullptr);
     LineTo(hdc, axisRight, axisY);
-    LineTo(hdc, axisRight - 8, axisY - 5);
-    MoveToEx(hdc, axisRight, axisY, nullptr);
-    LineTo(hdc, axisRight - 8, axisY + 5);
 
     for (int timeValue = 0; timeValue <= totalEndTime; ++timeValue) {
-        int x = inner.left + axisLeftWorld + (timeValue * axisWidthWorld) / totalEndTime - g_ganttScrollX;
-        if (x < inner.left - 40 || x > inner.right + 40) continue;
+        int x = canvasRect.left + axisLeftWorld + (timeValue * axisWidthWorld) / totalEndTime;
 
         MoveToEx(hdc, x, axisY, nullptr);
         LineTo(hdc, x, axisY + 7);
 
-        RECT tickRect{ x - 20, axisY + 10, x + 20, inner.bottom };
+        RECT tickRect{ x - 20, axisY + 10, x + 20, canvasRect.bottom };
         std::string timeText = std::to_string(timeValue);
         DrawTextA(hdc, timeText.c_str(), -1, &tickRect, DT_CENTER | DT_TOP | DT_SINGLELINE);
     }
@@ -721,31 +1116,22 @@ static void PaintGanttChart(HDC hdc, const RECT& clientRect) {
     SelectObject(hdc, oldPen);
     DeleteObject(axisPen);
 
-    RECT titleRect{ inner.left, inner.top - 2, inner.right, axisTop - 2 };
-    std::string headerText = "Final Gantt Chart";
-    DrawTextA(hdc, headerText.c_str(), -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
     int savedDc = SaveDC(hdc);
-    IntersectClipRect(hdc, inner.left, inner.top, inner.right, inner.bottom);
+    IntersectClipRect(hdc, canvasRect.left, canvasRect.top, canvasRect.right, canvasRect.bottom);
 
     for (size_t i = 0; i < g_currentSimulation.timeline.size(); ++i) {
         const auto& event = g_currentSimulation.timeline[i];
-        int left = inner.left + axisLeftWorld + (event.StartTime * axisWidthWorld) / totalEndTime - g_ganttScrollX;
-        int right = inner.left + axisLeftWorld + (event.EndTime * axisWidthWorld) / totalEndTime - g_ganttScrollX;
+        int left = canvasRect.left + axisLeftWorld + (event.StartTime * axisWidthWorld) / totalEndTime;
+        int right = canvasRect.left + axisLeftWorld + (event.EndTime * axisWidthWorld) / totalEndTime;
         if (right <= left) right = left + 1;
-        if (right - left < 30) right = left + 30;
-        if (right < inner.left || left > inner.right) continue;
+        if (right - left < 56) right = left + 56;
 
-        RECT barRect{
-            std::max(left, static_cast<int>(inner.left)),
-            barTop,
-            std::min(right, static_cast<int>(inner.right)),
-            barBottom
-        };
+        RECT barRect{ left, barTop, right, barBottom };
         if (barRect.right <= barRect.left) continue;
         COLORREF fillColor = ColorFromKey(event.QueueID + ":" + event.ProcessID);
+        COLORREF borderColor = AdjustColor(fillColor, -26);
         HBRUSH fillBrush = CreateSolidBrush(fillColor);
-        HPEN barPen = CreatePen(PS_SOLID, 1, RGB(80, 88, 96));
+        HPEN barPen = CreatePen(PS_SOLID, 1, borderColor);
         oldBrush = static_cast<HBRUSH>(SelectObject(hdc, fillBrush));
         oldPen = static_cast<HPEN>(SelectObject(hdc, barPen));
         RoundRect(hdc, barRect.left, barRect.top, barRect.right, barRect.bottom, 10, 10);
@@ -754,16 +1140,115 @@ static void PaintGanttChart(HDC hdc, const RECT& clientRect) {
         DeleteObject(fillBrush);
         DeleteObject(barPen);
 
-        RECT textRect = barRect;
-        InflateRect(&textRect, -6, -4);
-        SetTextColor(hdc, RGB(255, 255, 255));
-        std::string label = event.ProcessID + " | " + event.QueueID;
-        DrawTextA(hdc, label.c_str(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        COLORREF textColor = GetContrastingTextColor(fillColor);
+        int visibleWidth = barRect.right - barRect.left;
+
+        RECT processRect = barRect;
+        processRect.top += 8;
+        processRect.bottom = (visibleWidth >= 88) ? (barRect.top + (barHeight / 2) + 4) : (barRect.bottom - 8);
+        InflateRect(&processRect, -8, 0);
+        SetTextColor(hdc, textColor);
+        HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_hFontLabel ? g_hFontLabel : g_hFontUI));
+        DrawTextA(hdc, event.ProcessID.c_str(), -1, &processRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        if (visibleWidth >= 88) {
+            RECT queueRect = barRect;
+            queueRect.top = processRect.bottom - 2;
+            queueRect.bottom = barRect.bottom - 8;
+            InflateRect(&queueRect, -8, 0);
+            SelectObject(hdc, g_hFontUI ? g_hFontUI : oldFont);
+            DrawTextA(hdc, event.QueueID.c_str(), -1, &queueRect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+
+        SelectObject(hdc, oldFont);
     }
 
     RestoreDC(hdc, savedDc);
 
     SetTextColor(hdc, kColorTextMain);
+}
+
+static void EnsureGanttCanvasCache(HDC referenceHdc, const RECT& viewportRect) {
+    if (!referenceHdc) return;
+
+    if (!g_hasSimulationData || !g_currentSimulation.ok || g_currentSimulation.timeline.empty()) {
+        DestroyGanttCanvasCache();
+        return;
+    }
+
+    const int desiredWidth = std::max(GetGanttContentWidth(),
+        std::max(1, static_cast<int>(viewportRect.right - viewportRect.left)));
+    const int desiredHeight = std::max(1, static_cast<int>(viewportRect.bottom - viewportRect.top));
+
+    if (!g_ganttCanvasDirty &&
+        g_hGanttCanvasBitmap &&
+        g_ganttCanvasWidth == desiredWidth &&
+        g_ganttCanvasHeight == desiredHeight) {
+        return;
+    }
+
+    HDC memDc = CreateCompatibleDC(referenceHdc);
+    HBITMAP newBitmap = CreateCompatibleBitmap(referenceHdc, desiredWidth, desiredHeight);
+    if (!memDc || !newBitmap) {
+        if (newBitmap) DeleteObject(newBitmap);
+        if (memDc) DeleteDC(memDc);
+        return;
+    }
+
+    HBITMAP oldBitmap = static_cast<HBITMAP>(SelectObject(memDc, newBitmap));
+    RECT bitmapRect{ 0, 0, desiredWidth, desiredHeight };
+    PaintGanttCanvas(memDc, bitmapRect);
+    SelectObject(memDc, oldBitmap);
+    DeleteDC(memDc);
+
+    if (g_hGanttCanvasBitmap) {
+        DeleteObject(g_hGanttCanvasBitmap);
+    }
+    g_hGanttCanvasBitmap = newBitmap;
+    g_ganttCanvasWidth = desiredWidth;
+    g_ganttCanvasHeight = desiredHeight;
+    g_ganttCanvasDirty = false;
+}
+
+static void PaintGanttChart(HDC hdc, const RECT& clientRect) {
+    PaintGanttChartFrame(hdc, clientRect);
+
+    RECT inner = GetGanttInnerRect(clientRect);
+    if (inner.right <= inner.left || inner.bottom <= inner.top) return;
+
+    RECT titleRect{ inner.left, inner.top - 2, inner.right, inner.top + 24 };
+    std::string headerText = "Final Gantt Chart";
+    DrawTextA(hdc, headerText.c_str(), -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    RECT viewportRect = GetGanttCanvasViewportRect(clientRect);
+    if (viewportRect.right <= viewportRect.left || viewportRect.bottom <= viewportRect.top) return;
+
+    if (!g_hasSimulationData || !g_currentSimulation.ok || g_currentSimulation.timeline.empty()) {
+        DrawTextA(hdc, "Load a valid schedule to see the Gantt chart.", -1,
+                  &viewportRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return;
+    }
+
+    EnsureGanttCanvasCache(hdc, viewportRect);
+
+    if (!g_hGanttCanvasBitmap) {
+        DrawTextA(hdc, "Could not render the Gantt chart.", -1,
+                  &viewportRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return;
+    }
+
+    HDC cacheDc = CreateCompatibleDC(hdc);
+    if (!cacheDc) return;
+
+    HBITMAP oldBitmap = static_cast<HBITMAP>(SelectObject(cacheDc, g_hGanttCanvasBitmap));
+    const int viewportWidth = viewportRect.right - viewportRect.left;
+    const int viewportHeight = viewportRect.bottom - viewportRect.top;
+    BitBlt(hdc, viewportRect.left, viewportRect.top, viewportWidth, viewportHeight,
+           cacheDc, g_ganttScrollX, 0, SRCCOPY);
+    SelectObject(cacheDc, oldBitmap);
+    DeleteDC(cacheDc);
 }
 
 static LRESULT CALLBACK GanttChartProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -772,6 +1257,7 @@ static LRESULT CALLBACK GanttChartProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         return 1;
 
     case WM_SIZE:
+        InvalidateGanttCanvasCache();
         UpdateGanttScrollInfo();
         break;
 
@@ -817,6 +1303,179 @@ static LRESULT CALLBACK GanttChartProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         if (memDc) DeleteDC(memDc);
         EndPaint(hwnd, &ps);
         return 0;
+    }
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK ActionButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_ENABLE:
+    case WM_SETTEXT:
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+
+    case WM_MOUSEMOVE: {
+        int state = static_cast<int>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+        if ((state & ACTIONBTN_HOVER) == 0) {
+            state |= ACTIONBTN_HOVER;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, state);
+            TRACKMOUSEEVENT tme{};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE: {
+        int state = static_cast<int>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+        state &= ~(ACTIONBTN_HOVER | ACTIONBTN_PRESSED);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, state);
+        ReleaseCapture();
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        if (!IsWindowEnabled(hwnd)) return 0;
+        int state = static_cast<int>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+        state |= ACTIONBTN_PRESSED | ACTIONBTN_HOVER;
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, state);
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        int state = static_cast<int>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+        bool wasPressed = (state & ACTIONBTN_PRESSED) != 0;
+        state &= ~ACTIONBTN_PRESSED;
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, state);
+        ReleaseCapture();
+        InvalidateRect(hwnd, nullptr, TRUE);
+
+        if (wasPressed) {
+            POINT pt{
+                static_cast<short>(LOWORD(lParam)),
+                static_cast<short>(HIWORD(lParam))
+            };
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            if (PtInRect(&rc, pt)) {
+                HWND parent = GetParent(hwnd);
+                if (parent) {
+                    SendMessageA(parent, WM_COMMAND,
+                        MAKEWPARAM(GetDlgCtrlID(hwnd), BN_CLICKED),
+                        reinterpret_cast<LPARAM>(hwnd));
+                }
+            }
+        }
+        return 0;
+    }
+
+    case WM_CAPTURECHANGED: {
+        int state = static_cast<int>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+        if ((state & ACTIONBTN_PRESSED) != 0) {
+            state &= ~ACTIONBTN_PRESSED;
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, state);
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        PaintActionButton(hwnd, hdc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK RightTabPageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wParam), &rc, g_hMainBrush);
+        return 1;
+    }
+
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        int code = HIWORD(wParam);
+        if (code == BN_CLICKED) {
+            if (id == IDC_RIGHT_TAB_FILE_BTN) {
+                ActivateRightTab(RIGHT_TAB_FILE_VIEW);
+                return 0;
+            }
+            if (id == IDC_RIGHT_TAB_SCHEDULE_BTN) {
+                ActivateRightTab(RIGHT_TAB_SCHEDULE_VIEW);
+                return 0;
+            }
+        }
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (dis && (dis->CtlID == IDC_REFRESH_BTN || dis->CtlID == IDC_LOAD_BTN)) {
+            DrawActionButton(dis);
+            return TRUE;
+        }
+        if (dis && (dis->CtlID == IDC_RIGHT_TAB_FILE_BTN || dis->CtlID == IDC_RIGHT_TAB_SCHEDULE_BTN)) {
+            DrawRightTabButton(dis);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HBRUSH brush = ApplySharedControlColors(reinterpret_cast<HWND>(lParam), reinterpret_cast<HDC>(wParam));
+        return reinterpret_cast<INT_PTR>(brush ? brush : g_hMainBrush);
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetBkColor(hdc, kColorCardBg);
+        SetTextColor(hdc, kColorTextMain);
+        return reinterpret_cast<INT_PTR>(g_hCardBrush);
+    }
+
+    case WM_CTLCOLORLISTBOX: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetBkColor(hdc, kColorCardBg);
+        SetTextColor(hdc, kColorTextMain);
+        return reinterpret_cast<INT_PTR>(g_hCardBrush);
+    }
+
+    case WM_NOTIFY: {
+        NMHDR* hdr = reinterpret_cast<NMHDR*>(lParam);
+        HWND processHeader = g_hProcessList ? ListView_GetHeader(g_hProcessList) : nullptr;
+        if (hdr && hdr->hwndFrom == processHeader) {
+            switch (hdr->code) {
+            case HDN_BEGINTRACKA:
+            case HDN_BEGINTRACKW:
+            case HDN_TRACKA:
+            case HDN_TRACKW:
+            case HDN_DIVIDERDBLCLICKA:
+            case HDN_DIVIDERDBLCLICKW:
+                return TRUE;
+            default:
+                break;
+            }
+        }
+        break;
     }
     }
 
@@ -950,6 +1609,7 @@ static void ShowSelectedFileInfo(int index) {
         g_currentSimulation = simulation;
         g_hasSimulationData = simulation.ok;
         g_ganttScrollX = 0;
+        InvalidateGanttCanvasCache(true);
         PopulateProcessList(parsed, &simulation);
         UpdateGanttScrollInfo();
         RefreshSimulationView();
@@ -959,6 +1619,7 @@ static void ShowSelectedFileInfo(int index) {
         g_currentSimulation = SimulationResult{};
         g_hasSimulationData = false;
         g_ganttScrollX = 0;
+        InvalidateGanttCanvasCache(true);
         ClearProcessList();
         UpdateGanttScrollInfo();
         RefreshSimulationView();
@@ -1015,6 +1676,7 @@ static void ResetLoadedData(bool keepStatus = false) {
     g_currentDetailBase.clear();
     g_hasSimulationData = false;
     g_ganttScrollX = 0;
+    InvalidateGanttCanvasCache(true);
     g_hasLoadedDrive = false;
     RefreshSimulationView();
     if (!keepStatus) {
@@ -1102,12 +1764,12 @@ static void CreateChildControls(HWND hwnd) {
         WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_DRIVE_COMBO), GetModuleHandle(nullptr), nullptr);
 
-    CreateWindowExA(0, "BUTTON", "Refresh",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+    g_hRefreshBtn = CreateWindowExA(0, kActionButtonClass, "Refresh",
+        WS_CHILD | WS_VISIBLE,
         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_REFRESH_BTN), GetModuleHandle(nullptr), nullptr);
 
-    CreateWindowExA(0, "BUTTON", "Scan",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+    g_hScanBtn = CreateWindowExA(0, kActionButtonClass, "Scan",
+        WS_CHILD | WS_VISIBLE,
         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_LOAD_BTN), GetModuleHandle(nullptr), nullptr);
 
     g_hBootLabel = CreateWindowExA(0, "STATIC", "Boot Sector Overview",
@@ -1126,38 +1788,58 @@ static void CreateChildControls(HWND hwnd) {
         WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | WS_BORDER,
         0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_FILE_LIST), GetModuleHandle(nullptr), nullptr);
 
-    g_hDetailLabel = CreateWindowExA(0, "STATIC", "Selected File Details",
+    g_hRightTabs = CreateWindowExA(0, kRightTabPageClass, "",
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_RIGHT_TABS), GetModuleHandle(nullptr), nullptr);
+
+    g_hRightTabFileBtn = CreateWindowExA(0, "BUTTON", "File View",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_PUSHBUTTON,
+        0, 0, 0, 0, g_hRightTabs, reinterpret_cast<HMENU>(IDC_RIGHT_TAB_FILE_BTN), GetModuleHandle(nullptr), nullptr);
+
+    g_hRightTabScheduleBtn = CreateWindowExA(0, "BUTTON", "Schedule View",
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_PUSHBUTTON,
+        0, 0, 0, 0, g_hRightTabs, reinterpret_cast<HMENU>(IDC_RIGHT_TAB_SCHEDULE_BTN), GetModuleHandle(nullptr), nullptr);
+
+    g_hFileTabPage = CreateWindowExA(0, kRightTabPageClass, "",
+        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+        0, 0, 0, 0, g_hRightTabs, nullptr, GetModuleHandle(nullptr), nullptr);
+
+    g_hScheduleTabPage = CreateWindowExA(0, kRightTabPageClass, "",
+        WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
+        0, 0, 0, 0, g_hRightTabs, nullptr, GetModuleHandle(nullptr), nullptr);
+
+    g_hDetailLabel = CreateWindowExA(0, "STATIC", "Selected File Result",
         WS_CHILD | WS_VISIBLE,
-        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_LABEL), GetModuleHandle(nullptr), nullptr);
+        0, 0, 0, 0, g_hFileTabPage, reinterpret_cast<HMENU>(IDC_DETAIL_LABEL), GetModuleHandle(nullptr), nullptr);
 
     g_hDetailEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_READONLY,
-        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_DETAIL_EDIT), GetModuleHandle(nullptr), nullptr);
+        0, 0, 0, 0, g_hFileTabPage, reinterpret_cast<HMENU>(IDC_DETAIL_EDIT), GetModuleHandle(nullptr), nullptr);
 
     g_hContentLabel = CreateWindowExA(0, "STATIC", "File Content",
         WS_CHILD | WS_VISIBLE,
-        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_CONTENT_LABEL), GetModuleHandle(nullptr), nullptr);
+        0, 0, 0, 0, g_hFileTabPage, reinterpret_cast<HMENU>(IDC_CONTENT_LABEL), GetModuleHandle(nullptr), nullptr);
 
     g_hContentEdit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL |
         WS_VSCROLL | WS_HSCROLL | ES_READONLY,
-        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_CONTENT_EDIT), GetModuleHandle(nullptr), nullptr);
+        0, 0, 0, 0, g_hFileTabPage, reinterpret_cast<HMENU>(IDC_CONTENT_EDIT), GetModuleHandle(nullptr), nullptr);
 
     g_hGanttLabel = CreateWindowExA(0, "STATIC", "Gantt Chart",
         WS_CHILD | WS_VISIBLE,
-        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GANTT_LABEL), GetModuleHandle(nullptr), nullptr);
+        0, 0, 0, 0, g_hScheduleTabPage, reinterpret_cast<HMENU>(IDC_GANTT_LABEL), GetModuleHandle(nullptr), nullptr);
 
     g_hGanttChart = CreateWindowExA(WS_EX_CLIENTEDGE, kGanttChartClass, "",
         WS_CHILD | WS_VISIBLE | WS_HSCROLL,
-        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_GANTT_CHART), GetModuleHandle(nullptr), nullptr);
+        0, 0, 0, 0, g_hScheduleTabPage, reinterpret_cast<HMENU>(IDC_GANTT_CHART), GetModuleHandle(nullptr), nullptr);
 
     g_hProcessLabel = CreateWindowExA(0, "STATIC", "Scheduling Table",
         WS_CHILD | WS_VISIBLE,
-        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_PROCESS_LABEL), GetModuleHandle(nullptr), nullptr);
+        0, 0, 0, 0, g_hScheduleTabPage, reinterpret_cast<HMENU>(IDC_PROCESS_LABEL), GetModuleHandle(nullptr), nullptr);
 
     g_hProcessList = CreateWindowExA(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
         WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-        0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(IDC_PROCESS_LIST), GetModuleHandle(nullptr), nullptr);
+        0, 0, 0, 0, g_hScheduleTabPage, reinterpret_cast<HMENU>(IDC_PROCESS_LIST), GetModuleHandle(nullptr), nullptr);
 
     g_hStatusText = CreateWindowExA(0, "STATIC", "Choose a drive, then click Scan.",
         WS_CHILD | WS_VISIBLE,
@@ -1200,6 +1882,7 @@ static void CreateChildControls(HWND hwnd) {
     g_hFontLabel = CreateAppFont(11, FW_SEMIBOLD, "Segoe UI");
     g_hFontMono = CreateAppFont(10, FW_NORMAL, "Consolas");
     ApplyFontsToChildren(hwnd);
+    UpdateRightTabVisibility();
 
 }
 
@@ -1227,19 +1910,14 @@ static void LayoutControls(HWND hwnd) {
 
     int bootAreaH = contentH * 35 / 100;
     int fileAreaH = contentH - bootAreaH - gap;
-    int detailAreaH = 128;
-    int contentAreaH = 160;
-    int ganttAreaH = 170;
-    int processAreaH = contentH - detailAreaH - contentAreaH - ganttAreaH - sectionGap * 3;
-    if (processAreaH < 150) processAreaH = 150;
 
     const int comboW = 160;
     const int topGap = 8;
     const int refreshW = 96;
     const int scanW = 84;
     MoveWindow(g_hDriveCombo, margin, margin, comboW, topHeight, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_REFRESH_BTN), margin + comboW + topGap, margin, refreshW, topHeight, TRUE);
-    MoveWindow(GetDlgItem(hwnd, IDC_LOAD_BTN), margin + comboW + topGap + refreshW + topGap, margin, scanW, topHeight, TRUE);
+    MoveWindow(g_hRefreshBtn, margin + comboW + topGap, margin, refreshW, topHeight, TRUE);
+    MoveWindow(g_hScanBtn, margin + comboW + topGap + refreshW + topGap, margin, scanW, topHeight, TRUE);
 
     MoveWindow(g_hBootLabel, margin, usableTop, leftW, labelHeight, TRUE);
     MoveWindow(g_hBootList, margin, usableTop + labelHeight, leftW, bootAreaH - labelHeight, TRUE);
@@ -1249,27 +1927,57 @@ static void LayoutControls(HWND hwnd) {
     MoveWindow(g_hFileLabel, margin, fileY, leftW, labelHeight, TRUE);
     MoveWindow(g_hFileList, margin, fileY + labelHeight, leftW, fileAreaH - labelHeight, TRUE);
 
-    int detailY = usableTop;
-    MoveWindow(g_hDetailLabel, rightX, detailY, rightW, labelHeight, TRUE);
-    MoveWindow(g_hDetailEdit, rightX, detailY + labelHeight, rightW, detailAreaH - labelHeight, TRUE);
+    if (g_hRightTabs) {
+        MoveWindow(g_hRightTabs, rightX, usableTop, rightW, contentH, TRUE);
+        RECT tabsRc{};
+        GetClientRect(g_hRightTabs, &tabsRc);
+        const int tabsPadding = 4;
+        const int tabsTop = 6;
+        const int tabsGap = 0;
+        const int tabsHeight = 40;
+        int tabsClientW = std::max(0, static_cast<int>(tabsRc.right - tabsRc.left));
+        int tabsInnerW = std::max(0, tabsClientW - tabsPadding * 2);
+        int tabButtonW = std::max(0, (tabsInnerW - tabsGap) / 2);
+        MoveWindow(g_hRightTabFileBtn, tabsPadding, tabsTop, tabButtonW, tabsHeight, TRUE);
+        MoveWindow(g_hRightTabScheduleBtn, tabsPadding + tabButtonW + tabsGap, tabsTop,
+            std::max(0, tabsInnerW - tabButtonW - tabsGap), tabsHeight, TRUE);
 
-    int contentY = detailY + detailAreaH + sectionGap;
-    MoveWindow(g_hContentLabel, rightX, contentY, rightW, labelHeight, TRUE);
-    MoveWindow(g_hContentEdit, rightX, contentY + labelHeight, rightW, contentAreaH - labelHeight, TRUE);
+        RECT pageRect = GetRightTabPageRect(g_hRightTabs);
+        int pageW = static_cast<int>(pageRect.right - pageRect.left);
+        int pageH = static_cast<int>(pageRect.bottom - pageRect.top);
+        if (pageW < 0) pageW = 0;
+        if (pageH < 0) pageH = 0;
+        const int pagePadding = 4;
+        int contentW = std::max(0, pageW - pagePadding * 2);
+        int availableSectionH = std::max(0, pageH - pagePadding * 2 - sectionGap);
+        int firstSectionH = availableSectionH / 2;
+        int secondSectionH = availableSectionH - firstSectionH;
 
-    int ganttY = contentY + contentAreaH + sectionGap;
-    MoveWindow(g_hGanttLabel, rightX, ganttY, rightW, labelHeight, TRUE);
-    MoveWindow(g_hGanttChart, rightX, ganttY + labelHeight, rightW, ganttAreaH - labelHeight, TRUE);
-    UpdateGanttScrollInfo();
+        MoveWindow(g_hFileTabPage, pageRect.left, pageRect.top, pageW, pageH, TRUE);
+        MoveWindow(g_hScheduleTabPage, pageRect.left, pageRect.top, pageW, pageH, TRUE);
 
-    int processY = ganttY + ganttAreaH + sectionGap;
-    int remainingH = usableBottom - processY;
-    if (remainingH > labelHeight + 40) {
-        processAreaH = remainingH;
+        int firstTop = pagePadding;
+        int secondTop = firstTop + firstSectionH + sectionGap;
+
+        MoveWindow(g_hDetailLabel, pagePadding, firstTop, contentW, labelHeight, TRUE);
+        MoveWindow(g_hDetailEdit, pagePadding, firstTop + labelHeight, contentW,
+            std::max(0, firstSectionH - labelHeight), TRUE);
+
+        MoveWindow(g_hContentLabel, pagePadding, secondTop, contentW, labelHeight, TRUE);
+        MoveWindow(g_hContentEdit, pagePadding, secondTop + labelHeight, contentW,
+            std::max(0, secondSectionH - labelHeight), TRUE);
+
+        MoveWindow(g_hGanttLabel, pagePadding, firstTop, contentW, labelHeight, TRUE);
+        MoveWindow(g_hGanttChart, pagePadding, firstTop + labelHeight, contentW,
+            std::max(0, firstSectionH - labelHeight), TRUE);
+        UpdateGanttScrollInfo();
+
+        MoveWindow(g_hProcessLabel, pagePadding, secondTop, contentW, labelHeight, TRUE);
+        MoveWindow(g_hProcessList, pagePadding, secondTop + labelHeight, contentW,
+            std::max(0, secondSectionH - labelHeight), TRUE);
+        ResizeProcessColumns();
+        UpdateRightTabVisibility();
     }
-    MoveWindow(g_hProcessLabel, rightX, processY, rightW, labelHeight, TRUE);
-    MoveWindow(g_hProcessList, rightX, processY + labelHeight, rightW, processAreaH - labelHeight, TRUE);
-    ResizeProcessColumns();
 
     MoveWindow(g_hStatusText, margin, clientH - margin - statusHeight, clientW - margin * 2, statusHeight, TRUE);
 }
@@ -1299,6 +2007,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        if (id == IDC_RIGHT_TAB_FILE_BTN && code == BN_CLICKED) {
+            if (g_activeRightTab != RIGHT_TAB_FILE_VIEW) {
+                g_activeRightTab = RIGHT_TAB_FILE_VIEW;
+                LayoutControls(hwnd);
+            }
+            return 0;
+        }
+
+        if (id == IDC_RIGHT_TAB_SCHEDULE_BTN && code == BN_CLICKED) {
+            if (g_activeRightTab != RIGHT_TAB_SCHEDULE_VIEW) {
+                g_activeRightTab = RIGHT_TAB_SCHEDULE_VIEW;
+                LayoutControls(hwnd);
+                RedrawProcessTableHeader();
+            }
+            return 0;
+        }
+
         if (id == IDC_DRIVE_COMBO && code == CBN_SELCHANGE) {
             ResetLoadedData(true);
             std::string drive = GetSelectedDrive();
@@ -1322,44 +2047,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         break;
 
-    case WM_NOTIFY: {
-        NMHDR* hdr = reinterpret_cast<NMHDR*>(lParam);
-        HWND processHeader = g_hProcessList ? ListView_GetHeader(g_hProcessList) : nullptr;
-        if (hdr && hdr->hwndFrom == processHeader) {
-            switch (hdr->code) {
-            case HDN_BEGINTRACKA:
-            case HDN_BEGINTRACKW:
-            case HDN_TRACKA:
-            case HDN_TRACKW:
-            case HDN_DIVIDERDBLCLICKA:
-            case HDN_DIVIDERDBLCLICKW:
-                return TRUE;
-            default:
-                break;
-            }
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (dis && (dis->CtlID == IDC_RIGHT_TAB_FILE_BTN || dis->CtlID == IDC_RIGHT_TAB_SCHEDULE_BTN)) {
+            DrawRightTabButton(dis);
+            return TRUE;
         }
         break;
     }
 
     case WM_CTLCOLORSTATIC: {
-        HDC hdc = reinterpret_cast<HDC>(wParam);
-        HWND hCtrl = reinterpret_cast<HWND>(lParam);
-        if (hCtrl == g_hDetailEdit || hCtrl == g_hContentEdit) {
-            SetBkColor(hdc, kColorCardBg);
-            SetTextColor(hdc, kColorTextMain);
-            return reinterpret_cast<INT_PTR>(g_hCardBrush);
-        }
-        SetBkMode(hdc, TRANSPARENT);
-        if (hCtrl == g_hBootLabel || hCtrl == g_hFileLabel || hCtrl == g_hDetailLabel ||
-            hCtrl == g_hContentLabel || hCtrl == g_hGanttLabel || hCtrl == g_hProcessLabel) {
-            SetTextColor(hdc, kColorTextMain);
-            return reinterpret_cast<INT_PTR>(g_hMainBrush);
-        }
-        if (hCtrl == g_hStatusText) {
-            SetTextColor(hdc, kColorTextMuted);
-            return reinterpret_cast<INT_PTR>(g_hMainBrush);
-        }
-        return reinterpret_cast<INT_PTR>(g_hMainBrush);
+        HBRUSH brush = ApplySharedControlColors(reinterpret_cast<HWND>(lParam), reinterpret_cast<HDC>(wParam));
+        return reinterpret_cast<INT_PTR>(brush ? brush : g_hMainBrush);
     }
 
     case WM_CTLCOLOREDIT: {
@@ -1377,6 +2076,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_DESTROY:
+        DestroyGanttCanvasCache();
         if (g_hFontUI) DeleteObject(g_hFontUI);
         if (g_hFontLabel) DeleteObject(g_hFontLabel);
         if (g_hFontMono) DeleteObject(g_hFontMono);
@@ -1393,7 +2093,7 @@ static int RunGui(HINSTANCE hInstance, int nCmdShow, const std::string& initialD
     g_initialDrive = NormalizeDriveInput(initialDrive);
     INITCOMMONCONTROLSEX icc{};
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_LISTVIEW_CLASSES;
+    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES;
     InitCommonControlsEx(&icc);
 
     g_hMainBrush = CreateSolidBrush(kColorWindowBg);
@@ -1408,6 +2108,26 @@ static int RunGui(HINSTANCE hInstance, int nCmdShow, const std::string& initialD
     ganttClass.hbrBackground = nullptr;
     ganttClass.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClassExA(&ganttClass);
+
+    WNDCLASSEXA actionButtonClass{};
+    actionButtonClass.cbSize = sizeof(actionButtonClass);
+    actionButtonClass.lpfnWndProc = ActionButtonProc;
+    actionButtonClass.hInstance = hInstance;
+    actionButtonClass.lpszClassName = kActionButtonClass;
+    actionButtonClass.hCursor = LoadCursor(nullptr, IDC_HAND);
+    actionButtonClass.hbrBackground = nullptr;
+    actionButtonClass.style = CS_HREDRAW | CS_VREDRAW;
+    RegisterClassExA(&actionButtonClass);
+
+    WNDCLASSEXA pageClass{};
+    pageClass.cbSize = sizeof(pageClass);
+    pageClass.lpfnWndProc = RightTabPageProc;
+    pageClass.hInstance = hInstance;
+    pageClass.lpszClassName = kRightTabPageClass;
+    pageClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    pageClass.hbrBackground = g_hMainBrush;
+    pageClass.style = CS_HREDRAW | CS_VREDRAW;
+    RegisterClassExA(&pageClass);
 
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
@@ -1427,7 +2147,7 @@ static int RunGui(HINSTANCE hInstance, int nCmdShow, const std::string& initialD
         0,
         wc.lpszClassName,
         kAppTitle,
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT,
         1360, 860,
         nullptr, nullptr, hInstance, nullptr
